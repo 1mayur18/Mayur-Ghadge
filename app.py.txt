@@ -1,0 +1,279 @@
+import streamlit as st
+import plotly.graph_objects as go
+import pandas as pd
+import numpy as np
+from io import StringIO
+
+# ====================================================================
+# PAGE CONFIG
+# ====================================================================
+st.set_page_config(
+    page_title="SIT-Vis: Spontaneous Ignition Temperature Analyzer",
+    page_icon="🔥",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ====================================================================
+# SYNTHETIC DATA / PHYSICS (vectorized & robust)
+# ====================================================================
+
+def generate_fuel_properties():
+    return {
+        'Methane': {
+            'SIT_base': 580.0,
+            'activation_energy': 25.0,
+            'stoich_afr': 17.2,
+            'color': '#FF6B6B'
+        },
+        'Propane': {
+            'SIT_base': 493.0,
+            'activation_energy': 22.0,
+            'stoich_afr': 15.7,
+            'color': '#4ECDC4'
+        },
+        'n-Heptane': {
+            'SIT_base': 215.0,
+            'activation_energy': 18.0,
+            'stoich_afr': 15.1,
+            'color': '#45B7D1'
+        },
+        'Hydrogen': {
+            'SIT_base': 585.0,
+            'activation_energy': 30.0,
+            'stoich_afr': 34.3,
+            'color': '#FFA07A'
+        }
+    }
+
+def calculate_sit_pressure_effect_vec(fuel_props, pressures):
+    """
+    Vectorized SIT(P) = SIT_base * P^{-k}  (equivalent to exp(-k ln P))
+    pressures: numpy array (must be > 0)
+    """
+    SIT_base = float(fuel_props['SIT_base'])
+    Ea = float(fuel_props['activation_energy'])
+    k = Ea / 100.0
+    pressures = np.asarray(pressures, dtype=float)
+    pressures = np.clip(pressures, 1e-6, None)
+    return SIT_base * np.exp(-k * np.log(pressures))  # = SIT_base * pressures ** (-k)
+
+def calculate_sit_afr_effect_vec(fuel_props, afr_ratios):
+    """
+    Vectorized SIT as function of afr_ratio (relative to stoichiometric).
+    phi = 1 / afr_ratio (equivalence ratio)
+    Parabolic U-shape around phi=1
+    """
+    SIT_base = float(fuel_props['SIT_base'])
+    phi = 1.0 / np.asarray(afr_ratios, dtype=float)
+    SIT_min = SIT_base * 0.85
+    a = 0.3
+    return SIT_min * (1.0 + a * (phi - 1.0)**2)
+
+def generate_pt_diagram_data_vec(fuel_props, num_points=200, p_min=0.1, p_max=100.0):
+    # Logarithmic pressure range from p_min to p_max (bars)
+    pressures = np.logspace(np.log10(p_min), np.log10(p_max), num_points)
+    temps = calculate_sit_pressure_effect_vec(fuel_props, pressures)
+    return pd.DataFrame({'Pressure_bar': pressures, 'Temperature_C': temps})
+
+def generate_afr_sensitivity_data_vec(fuel_props, pressure, num_points=100):
+    afr_ratios = np.linspace(0.5, 2.0, num_points)
+    base_sit = calculate_sit_pressure_effect_vec(fuel_props, pressure)
+    sit_afr = calculate_sit_afr_effect_vec(fuel_props, afr_ratios)
+    sit_combined = base_sit * (sit_afr / float(fuel_props['SIT_base']))
+    return pd.DataFrame({'AFR_Ratio': afr_ratios, 'Temperature_C': sit_combined})
+
+def check_safety_status(current_temp_c, current_pressure, fuel_props):
+    sit_at_pressure = float(calculate_sit_pressure_effect_vec(fuel_props, np.array([current_pressure]))[0])
+    return current_temp_c < sit_at_pressure, sit_at_pressure
+
+# ====================================================================
+# MAIN APP
+# ====================================================================
+def main():
+    st.title("🔥 SIT-Vis: Spontaneous Ignition Temperature Analyzer")
+    st.markdown("""
+    Visualize auto-ignition boundaries for common fuels as a function of pressure, temperature and mixture.
+    **For educational use only** — simplified correlations are used.
+    """)
+
+    fuel_properties = generate_fuel_properties()
+
+    # Sidebar controls
+    st.sidebar.header("⚙️ Operating Parameters")
+
+    selected_fuel = st.sidebar.selectbox("Select Fuel:", list(fuel_properties.keys()), index=0)
+    fuel_props = fuel_properties[selected_fuel]
+
+    # Pressure slider: allow sub-atmospheric to high pressures
+    pressure = st.sidebar.slider("Pressure (bar):", min_value=0.1, max_value=200.0, value=10.0, step=0.1,
+                                 help="Higher pressure typically lowers the spontaneous ignition temperature (empirical).")
+
+    # Temperature slider in Celsius
+    temperature_c = st.sidebar.slider("Operating Temperature (°C):", min_value=-20, max_value=1200, value=400, step=1)
+
+    # AFR slider (relative to stoichiometric)
+    afr_ratio = st.sidebar.slider("Air-Fuel Ratio (Relative to Stoichiometric):", min_value=0.5, max_value=2.0, value=1.0, step=0.01)
+
+    st.sidebar.markdown("---")
+    st.sidebar.info(f"""
+    **Fuel Properties:**
+    - Base SIT @ 1 bar: {fuel_props['SIT_base']} °C  
+    - Stoichiometric AFR: {fuel_props['stoich_afr']:.2f} (mass basis)  
+    - Current AFR (relative): {afr_ratio:.2f} × stoich
+    """, icon="ℹ️")
+
+    # Kelvin toggle for display (internal calcs remain in °C)
+    show_kelvin = st.sidebar.checkbox("Show temperatures in Kelvin", value=False)
+
+    # Safety check
+    is_safe, sit_current = check_safety_status(temperature_c, pressure, fuel_props)
+    if is_safe:
+        st.success(f"✅ SAFE — Operating Temperature {temperature_c}°C is {sit_current - temperature_c:.1f}°C below SIT at {pressure} bar.")
+    else:
+        st.error(f"⚠️ WARNING — Operating Temperature {temperature_c}°C is {temperature_c - sit_current:.1f}°C above SIT at {pressure} bar!")
+
+    st.markdown("---")
+
+    # Tabs
+    tab1, tab2 = st.tabs(["📊 P-T Diagram", "📈 AFR Sensitivity"])
+
+    # TAB 1: P-T Diagram (boundary + point + annotations)
+    with tab1:
+        st.header("Pressure–Temperature Auto-Ignition Boundary")
+        st.markdown("Boundary is SIT vs pressure. Current operating point shown as marker.")
+
+        # Generate data (wider range; allow p_min < 1)
+        pt_data = generate_pt_diagram_data_vec(fuel_props, num_points=300, p_min=0.1, p_max=200.0)
+
+        # Plot boundary (Temperature on x, Pressure on y log axis)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=pt_data['Temperature_C'],
+            y=pt_data['Pressure_bar'],
+            mode='lines',
+            line=dict(color=fuel_props['color'], width=3),
+            name=f'{selected_fuel} SIT Boundary',
+            hovertemplate='Temperature: %{x:.1f}°C<br>Pressure: %{y:.2f} bar<extra></extra>'
+        ))
+
+        # Add current operating point
+        fig.add_trace(go.Scatter(
+            x=[temperature_c],
+            y=[pressure],
+            mode='markers',
+            marker=dict(size=14, color='green' if is_safe else 'red', symbol='circle', line=dict(color='white', width=1.5)),
+            name='Current Operating Point',
+            hovertemplate='Operating Temp: %{x:.1f}°C<br>Pressure: %{y:.2f} bar<extra></extra>'
+        ))
+
+        # Annotate safe/danger explanation (instead of filled polygons which can be tricky on log axes)
+        fig.add_annotation(x=pt_data['Temperature_C'].min()*1.05, y=pt_data['Pressure_bar'].min()*1.0,
+                           text="Below boundary ≈ safer region", showarrow=False, yanchor="bottom", font=dict(color="green"))
+        fig.add_annotation(x=pt_data['Temperature_C'].max()*0.98, y=pt_data['Pressure_bar'].max()*0.98,
+                           text="Above boundary ≈ auto-ignition risk", showarrow=False, yanchor="top", font=dict(color="red"))
+
+        fig.update_layout(
+            xaxis_title="Temperature (°C)" + (" / K" if show_kelvin else ""),
+            yaxis_title="Pressure (bar)",
+            yaxis_type="log",
+            hovermode='closest',
+            height=600,
+            plot_bgcolor='white',
+            xaxis=dict(showgrid=True, gridcolor='lightgray'),
+            yaxis=dict(showgrid=True, gridcolor='lightgray')
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Data table & download
+        if show_kelvin:
+            display_df = pt_data.copy()
+            display_df['Temperature_K'] = display_df['Temperature_C'] + 273.15
+            st.dataframe(display_df[['Pressure_bar', 'Temperature_C', 'Temperature_K']].round(3), use_container_width=True, height=300)
+        else:
+            st.dataframe(pt_data.round({'Pressure_bar':3, 'Temperature_C':2}), use_container_width=True, height=300)
+
+        csv_buf = StringIO()
+        pt_data.to_csv(csv_buf, index=False)
+        st.download_button("Download P-T data (CSV)", csv_buf.getvalue(), file_name=f"PT_data_{selected_fuel}.csv", mime="text/csv")
+
+    # TAB 2: AFR Sensitivity
+    with tab2:
+        st.header("AFR Sensitivity at selected pressure")
+        st.markdown("U-shaped SIT vs AFR curve (stoichiometric mixtures are typically easiest to ignite).")
+
+        afr_data = generate_afr_sensitivity_data_vec(fuel_props, pressure, num_points=200)
+
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(
+            x=afr_data['AFR_Ratio'],
+            y=afr_data['Temperature_C'],
+            mode='lines',
+            line=dict(color=fuel_props['color'], width=3),
+            name=f'{selected_fuel} @ {pressure} bar',
+            hovertemplate='AFR ratio: %{x:.2f}<br>SIT: %{y:.1f}°C<extra></extra>'
+        ))
+
+        # current AFR marker
+        current_sit_afr = float(calculate_sit_afr_effect_vec(fuel_props, np.array([afr_ratio]))[0])
+        base_sit = float(calculate_sit_pressure_effect_vec(fuel_props, np.array([pressure]))[0])
+        current_sit_combined = base_sit * (current_sit_afr / float(fuel_props['SIT_base']))
+
+        fig2.add_trace(go.Scatter(
+            x=[afr_ratio],
+            y=[current_sit_combined],
+            mode='markers',
+            marker=dict(size=12, color='orange', symbol='diamond', line=dict(color='white', width=1.5)),
+            name='Current AFR',
+            hovertemplate='AFR ratio: %{x:.2f}<br>SIT: %{y:.1f}°C<extra></extra>'
+        ))
+
+        fig2.add_vline(x=1.0, line_dash="dash", line_color="gray",
+                       annotation_text="Stoichiometric", annotation_position="top left")
+
+        fig2.update_layout(
+            xaxis_title="Air-Fuel Ratio (relative to stoichiometric)",
+            yaxis_title="Spontaneous Ignition Temperature (°C)",
+            hovermode='closest',
+            height=600,
+            plot_bgcolor='white',
+            xaxis=dict(showgrid=True, gridcolor='lightgray'),
+            yaxis=dict(showgrid=True, gridcolor='lightgray')
+        )
+
+        st.plotly_chart(fig2, use_container_width=True)
+
+        # Key metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            min_sit = float(afr_data['Temperature_C'].min())
+            min_afr = float(afr_data.loc[afr_data['Temperature_C'].idxmin(), 'AFR_Ratio'])
+            st.metric("Minimum SIT", f"{min_sit:.1f} °C", f"at AFR = {min_afr:.2f}")
+
+        with col2:
+            st.metric("Current SIT", f"{current_sit_combined:.1f} °C", f"{current_sit_combined - min_sit:.1f} °C above min")
+
+        with col3:
+            phi = 1.0 / afr_ratio
+            mixture_type = "Stoichiometric" if 0.95 <= afr_ratio <= 1.05 else ("Rich" if afr_ratio < 1.0 else "Lean")
+            st.metric("Mixture Type", mixture_type, f"φ = {phi:.2f}")
+
+        st.dataframe(afr_data.round({'AFR_Ratio':3, 'Temperature_C':2}), use_container_width=True, height=260)
+
+        csv_buf2 = StringIO()
+        afr_data.to_csv(csv_buf2, index=False)
+        st.download_button("Download AFR data (CSV)", csv_buf2.getvalue(), file_name=f"AFR_data_{selected_fuel}.csv", mime="text/csv")
+
+    # Footer / disclaimer
+    st.markdown("---")
+    st.markdown("""
+    <div style='text-align:center; color:gray; font-size:0.9em;'>
+    <b>SIT-Vis v1.1</b> — Educational tool. The correlations are simplified; do not use as engineering proof. 
+    Consult official safety data sheets and perform full hazard analysis for real systems.
+    </div>
+    """, unsafe_allow_html=True)
+
+
+if __name__ == "__main__":
+    main()
